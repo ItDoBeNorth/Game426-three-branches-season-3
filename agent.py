@@ -1,4 +1,4 @@
-"""A small Days at Three Branches starter built entirely from ``sandbox.village``."""
+"""A Days at Three Branches agent built entirely from ``sandbox.village``."""
 
 import heapq
 import math
@@ -12,7 +12,7 @@ from sandbox.village import action, day, geometry, layout, me, people, props
 # reserved for the end-of-day return home, not idle flavor.
 _TIMED_USE_TICKS = {"plot": 50, "shrine": 75, "bell": 15, "pump": 5}
 _TOGGLE_USE_TICKS = 5
-_OCCUPANCY_USE_TICKS = (6, 9)
+_OCCUPANCY_USE_TICKS = (6, 9) 
 _TOGGLE_TYPES = ("lantern", "hearth", "stall")
 _OCCUPANCY_TYPES = ("bench", "repair_bench")
 # Catalog durations: a timed prop stays done this long after its last use, then reverts
@@ -53,7 +53,35 @@ _PROP_START_STATE = {
     "bell": "silent",
 }
 _STUCK_TICKS_LIMIT = 30  # abandon a destination after this many ticks of near-zero movement
-_GREET_COOLDOWN_TICKS = 100  # per person, so a lingering neighbour isn't greeted every tick
+_INTERACTION_COOLDOWN_TICKS = 300  # per pair; a greeting and its reply both restart it
+_MIDDAY_TICKS = (481, 720)  # rules.json's midday phase; day/night is off this season, so go by tick
+_FAMILY_TIME_TICKS = 40  # time spent together once family has met at the home doorway
+_FAMILY_WAIT_TICKS = 120  # how long to wait at the doorway for family before going back to work
+_FAMILY_TRAVEL_TICKS = 300  # give up the walk home if it takes longer than this
+_FAMILY_MEET_DISTANCE = 3.0  # metres; this close counts as together
+_VISITOR_NEWS_TICKS = 300  # after meeting the visitor, greetings this soon mention it
+_VISITOR_NEWS = " I saw the visitor recently."
+_REPLY_DELAY_TICKS = 3  # beat before answering someone who greeted us
+_REPLY_WINDOW_TICKS = 30  # a greeting not answered within this long is let go
+_GREETING_NOTICE_RANGE = 6.0  # metres (hearing range); a wave or nod from farther isn't meant for us
+_GREETING_FACING_DEGREES = 30.0  # they must be facing us this closely for a wave or nod to count
+_DISTANT_WAVE_COOLDOWN_TICKS = 40  # after a silent wave at someone out of earshot, don't re-notice them
+_FAMILY_GREET_AFTER_TICK = 50  # family just left the same house, so they ignore each other until then
+_GREETING_LINES = {
+    "visitor": "Hello visitor.",
+    "stranger": "Hello stranger.",
+    "acquaintance": "Hello again.",
+    "friend": "Hello friend.",
+    "family": "How are you, family?",
+}
+_REPLY_LINES = {
+    "visitor": "Have a good day.",
+    "stranger": "Hey.",
+    "acquaintance": "Hello indeed.",
+    "friend": "Nice day, isn't it?",
+    "family": "I'm good, I will see you later.",
+}
+_WAVE_RELATIONS = ("visitor", "friend", "family")  # everyone else gets a nod
 _STARTLE_COOLDOWN_TICKS = 20  # separate & shorter, so startling doesn't use up the greet cooldown
 _GREET_DELAY_TICKS = 10  # beat spent facing someone after noticing them, before actually greeting
 _VISITOR_APPROACH_RANGE = 8.0  # blocks; only detour to greet if visitor is this close when noticed
@@ -268,7 +296,16 @@ class Agent:
         self.timed_done = {}  # {prop_id: tick} when this villager finished a timed prop
         self.prop_memory = {}  # {prop_id: (state, tick)} as last seen
         self.arrival_looks = 0  # ticks spent turning to see the current target on arrival
-        self.greeted = {}  # {player_id: last_greeted_tick}, per-person greet cooldown
+        self.interactions = {}  # {player_id: {"last", "count", "initiated_by"}} greetings and replies
+        self.reply_due = {}  # {player_id: tick they greeted us} still waiting for our answer
+        self.homes = {entry["id"]: entry["home"] for entry in people.roster(observation)}
+        self.seen_ever = set()  # everyone this villager has laid eyes on today
+        self.distant_waves = {}  # {player_id: tick} of silent waves at people out of earshot
+        self.family_lunch = None  # {"stage": going|waiting|together, "since", "partner"?} during family time
+        self.family_lunch_done = False  # once a day
+        self.met_visitor_tick = None  # last real exchange with the visitor
+        self.news_told = set()  # villagers already told about that visitor meeting
+        self._passing_emote = None  # wave added to this tick's action after greeting a friend on the move
         self.startled = {}  # {player_id: last_startled_tick}, separate from greeted on purpose
         self.pending_greet = None  # {"id", "ready_tick", "approach_player"?} while greeting
 
@@ -526,7 +563,7 @@ class Agent:
             return self._give_up_target(observation, heading)  # never came into view
         self._clear_target()  # already done by someone else; memory now knows
         return action.stand(heading, "shrug")
-
+ 
     def _clear_target(self) -> None:
         self.role_target = None
         self.hop_point = None
@@ -628,6 +665,83 @@ class Agent:
             return None
         return bell_pos
 
+    def _cooled(self, player_id: str, tick: int) -> bool:
+        """Whether the pair cooldown with this person has run out (or we've never interacted)."""
+        entry = self.interactions.get(player_id)
+        return entry is None or tick - entry["last"] >= _INTERACTION_COOLDOWN_TICKS
+
+    def _record_interaction(self, player_id: str, tick: int, initiated_by: str) -> None:
+        """Log a greeting or reply; a new exchange only counts once the cooldown had run out."""
+        entry = self.interactions.get(player_id)
+        if entry is None:
+            entry = self.interactions[player_id] = {"last": tick, "count": 0, "initiated_by": initiated_by}
+        if tick - entry["last"] >= _INTERACTION_COOLDOWN_TICKS or entry["count"] == 0:
+            entry["count"] += 1
+            entry["initiated_by"] = initiated_by
+        entry["last"] = tick
+        if people.is_visitor(player_id):
+            self.met_visitor_tick = tick
+            self.news_told = set()
+
+    def _greeting_text(self, kind: str, player_id: str, tick: int) -> str:
+        """The greeting line, plus visitor news for anyone not yet told about a recent meeting."""
+        text = _GREETING_LINES[kind]
+        recent = self.met_visitor_tick is not None and tick - self.met_visitor_tick <= _VISITOR_NEWS_TICKS
+        if kind != "visitor" and recent and player_id not in self.news_told:
+            self.news_told.add(player_id)
+            text += _VISITOR_NEWS
+        return text
+
+    def _greeting_me(self, person, here) -> bool:
+        """A wave or nod from someone close by who is facing us."""
+        if person["expression"]["type"] not in ("wave", "nod"):
+            return False
+        if geometry.distance(person["position"], here) > _GREETING_NOTICE_RANGE:
+            return False
+        toward_me = geometry.heading_to(person["position"], here)
+        gap = abs((float(person["heading"]) - toward_me + 180.0) % 360.0 - 180.0)
+        return gap <= _GREETING_FACING_DEGREES
+
+    def relation(self, player_id: str) -> str:
+        """visitor, family (same home), friend (same role, once seen), acquaintance (has greeted or
+        been greeted), else stranger."""
+        if people.is_visitor(player_id):
+            return "visitor"
+        if self.home != "none" and self.homes.get(player_id) == self.home:
+            return "family"
+        if player_id in self.seen_ever and people.is_npc(player_id) and _role_of(player_id) == self.role:
+            return "friend"
+        entry = self.interactions.get(player_id)
+        if entry is not None and entry["count"] > 0:
+            return "acquaintance"
+        return "stranger"
+
+    def _may_greet(self, player_id: str, tick: int) -> bool:
+        if self.relation(player_id) == "family" and tick < _FAMILY_GREET_AFTER_TICK:
+            return False
+        return self._cooled(player_id, tick)
+
+    def _greeted_by(self, player_id: str, tick: int) -> None:
+        """They greeted us first: turn our own pending greeting into the answer, or owe them one."""
+        if self.pending_greet is not None and self.pending_greet["id"] == player_id:
+            self.pending_greet["reply"] = True
+            self.pending_greet["ready_tick"] = min(self.pending_greet["ready_tick"], tick + _REPLY_DELAY_TICKS)
+        elif self._cooled(player_id, tick):
+            self.reply_due.setdefault(player_id, tick)
+
+    def _goes_second(self, person, here) -> bool:
+        """When two villagers face each other, the lower player number speaks first."""
+        if not people.is_npc(person["id"]) or "heading" not in person:
+            return False
+        toward_me = geometry.heading_to(person["position"], here)
+        gap = abs((float(person["heading"]) - toward_me + 180.0) % 360.0 - 180.0)
+        return gap <= geometry.VISION_DEGREES / 2 and _player_number(person["id"]) < self.number
+
+    def _say(self, player_id: str, text: str, nearby_ids) -> None:
+        """Speak to someone directly, only if they're in earshot (otherwise it would be dropped)."""
+        if player_id in nearby_ids:
+            self._outbox.append({"to": player_id, "text": text})
+
     def _react_to_people(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction | None:
         """Stop and turn toward whoever just showed up, or None when nobody is due a reaction.
 
@@ -641,6 +755,7 @@ class Agent:
         seen_ids = {person["id"] for person in seen}
         # Chat is only delivered to someone in hearing range, so speaking needs this, not sight
         nearby_ids = {person["id"] for person in nearby}
+        self.seen_ever.update(seen_ids)
 
         def find(player_id: str):
             """That person's current record, from sight or hearing, or None once they are gone."""
@@ -651,6 +766,16 @@ class Agent:
                 if person["id"] == player_id:
                     return person
             return None
+
+        # Someone waving or nodding at us: inside the cooldown it's their reply (it still counts and
+        # restarts the cooldown); outside it, we owe them an answer
+        for person in seen:
+            if not self._greeting_me(person, here):
+                continue
+            if self._cooled(person["id"], tick):
+                self._greeted_by(person["id"], tick)
+            else:
+                self._record_interaction(person["id"], tick, "them")
 
         # Already noticed someone: walk to them if they started close by, then greet
         if self.pending_greet is not None:
@@ -669,40 +794,86 @@ class Agent:
                     return action.stand(facing, "none")
 
                 player_id = person["id"]
-                self.greeted[player_id] = tick
+                reply = self.pending_greet.get("reply")
+                kind = self.relation(player_id)  # read before recording, so a first meeting is still "stranger"
+                if player_id not in nearby_ids:
+                    # Too far to be heard: a silent wave or nod, and no exchange is logged, so a real
+                    # one still happens when they come into earshot
+                    self.pending_greet = None
+                    self.distant_waves[player_id] = tick
+                    return action.stand(facing, "wave" if kind in _WAVE_RELATIONS else "nod")
+                self._record_interaction(player_id, tick, "them" if reply else "me")
                 self.pending_greet = None
-                if people.is_visitor(player_id):
-                    if player_id in nearby_ids:  # close enough that a greeting would carry
-                        self._outbox.append({"to": player_id, "text": "Hello."})
-                    return action.stand(facing, "wave")
-                return action.stand(facing, "nod")
+                text = _REPLY_LINES[kind] if reply else self._greeting_text(kind, player_id, tick)
+                self._say(player_id, text, nearby_ids)
+                return action.stand(facing, "wave" if kind in _WAVE_RELATIONS else "nod")
 
         def greet_due(player_id: str) -> bool:
-            return tick - self.greeted.get(player_id, -_GREET_COOLDOWN_TICKS) >= _GREET_COOLDOWN_TICKS
+            if tick - self.distant_waves.get(player_id, -_DISTANT_WAVE_COOLDOWN_TICKS) < _DISTANT_WAVE_COOLDOWN_TICKS:
+                return False
+            return self._may_greet(player_id, tick)
+
+        def greet_friend_in_passing(player_id: str, reply: bool) -> None:
+            """Friends don't stop: say the line and wave while carrying on with whatever we're doing."""
+            self._record_interaction(player_id, tick, "them" if reply else "me")
+            text = _REPLY_LINES["friend"] if reply else self._greeting_text("friend", player_id, tick)
+            self._say(player_id, text, nearby_ids)
+            self._passing_emote = "wave"
 
         def startle_due(player_id: str) -> bool:
             return tick - self.startled.get(player_id, -_STARTLE_COOLDOWN_TICKS) >= _STARTLE_COOLDOWN_TICKS
 
-        def notice(person, expression: str):
+        def notice(person, expression: str, reply: bool = False):
             """Turn toward someone and start the beat that ends in a wave or a nod."""
             approach = (
-                people.is_visitor(person["id"])
+                not reply
+                and people.is_visitor(person["id"])
                 and geometry.distance(here, person["position"]) <= _VISITOR_APPROACH_RANGE
             )
+            delay = _REPLY_DELAY_TICKS if reply else _GREET_DELAY_TICKS
+            if not reply and self._goes_second(person, here):
+                delay += _GREET_DELAY_TICKS  # let them speak first; we greet anyway if they don't
             self.pending_greet = {
                 "id": person["id"],
-                "ready_tick": tick + _GREET_DELAY_TICKS,
+                "ready_tick": tick + delay,
                 "approach_player": approach,
+                "reply": reply,
             }
             return action.stand(geometry.heading_to(here, person["position"]), expression)
+
+        # Answer anyone who greeted us first, while they're still around
+        for player_id, since in list(self.reply_due.items()):
+            del self.reply_due[player_id]
+            person = find(player_id)
+            if person is None or tick - since > _REPLY_WINDOW_TICKS or not greet_due(player_id):
+                continue
+            if self.relation(player_id) == "friend":
+                if player_id in nearby_ids:
+                    greet_friend_in_passing(player_id, reply=True)
+                    return None
+                continue
+            return notice(person, "none", reply=True)
 
         # The visitor comes first
         visitor = next((person for person in seen if people.is_visitor(person["id"])), None)
         if visitor is not None and greet_due(visitor["id"]):
             return notice(visitor, "none")
 
+        # Friends in earshot get a greeting on the move; friends farther off wait until they're closer
+        for person in nearby:
+            if self.relation(person["id"]) != "friend" or not greet_due(person["id"]):
+                continue
+            sighted = find(person["id"]) if person["id"] in seen_ids else person
+            if sighted is not person and self._goes_second(sighted, here):
+                continue  # they'll greet us first and we answer in passing
+            greet_friend_in_passing(person["id"], reply=False)
+            return None
+
         for person in seen:
-            if not people.is_visitor(person["id"]) and greet_due(person["id"]):
+            player_id = person["id"]
+            if people.is_visitor(player_id) or self.relation(player_id) == "friend":
+                continue
+            if greet_due(player_id):
                 return notice(person, "none")
 
         # Heard but not seen means they are in the blind spot behind us, so the beat opens with a
@@ -710,11 +881,70 @@ class Agent:
         for person in nearby:
             if person["id"] in seen_ids:
                 continue
+            if self.relation(person["id"]) == "friend":
+                continue
             if startle_due(person["id"]) and greet_due(person["id"]):
                 self.startled[person["id"]] = tick
                 return notice(person, "startle")
 
         return None
+
+    def _family(self) -> list[str]:
+        return [pid for pid, home in self.homes.items() if home == self.home and pid != self.player_id]
+
+    def _family_time_due(self, tick: int) -> bool:
+        return (
+            not self.family_lunch_done
+            and self.home_doorway is not None
+            and _MIDDAY_TICKS[0] <= tick <= _MIDDAY_TICKS[1]
+            and bool(self._family())
+        )
+
+    def _family_lunch_tick(self, observation: ThreeBranchesObservation, heading: float, here, tick: int):
+        """Walk to the home doorway, wait for family, spend a little time together, then go back to work."""
+        lunch = self.family_lunch
+
+        def finish():
+            self.family_lunch = None
+            self.family_lunch_done = True
+            self._path = None
+            return action.stand(heading, "wave")
+
+        if tick > _MIDDAY_TICKS[1] and lunch["stage"] != "together":
+            return finish()
+
+        if lunch["stage"] == "going":
+            # Family already standing at the door (and blocking it) counts as having arrived
+            near_family = any(
+                person is not None and geometry.distance(here, person["position"]) <= _FAMILY_MEET_DISTANCE
+                for person in (people.find(observation, player_id) for player_id in self._family())
+            )
+            if not near_family and geometry.distance(here, self.home_doorway) > 1.5:
+                if tick - lunch["since"] > _FAMILY_TRAVEL_TICKS:
+                    return finish()
+                walk_heading = self._walk_toward(self.home_doorway, observation)
+                if self._walk_failed:
+                    return finish()
+                return action.walk(walk_heading, 1.0, "none")
+            lunch["stage"], lunch["since"] = "waiting", tick
+
+        if lunch["stage"] == "waiting":
+            for player_id in self._family():
+                person = people.find(observation, player_id)
+                if person is not None and geometry.distance(here, person["position"]) <= _FAMILY_MEET_DISTANCE:
+                    lunch.update(stage="together", since=tick, partner=player_id)
+                    return action.stand(geometry.heading_to(here, person["position"]), "wave")
+            if tick - lunch["since"] > _FAMILY_WAIT_TICKS:
+                return finish()
+            return action.stand(heading, "none")
+
+        # Together: face each other, with the odd laugh or nod
+        if tick - lunch["since"] >= _FAMILY_TIME_TICKS:
+            return finish()
+        partner = people.find(observation, lunch["partner"])
+        facing = geometry.heading_to(here, partner["position"]) if partner is not None else heading
+        expression = self.rng.choice(("laugh", "nod")) if (tick - lunch["since"]) % 12 == 6 else "none"
+        return action.stand(facing, expression)
 
     def _task_tick(self, observation: ThreeBranchesObservation, heading: float, here) -> ThreeBranchesAction:
         """One tick of role-driven work: answer the bell, grab a passing light, else do the job."""
@@ -773,6 +1003,21 @@ class Agent:
                 self.use_counter += 1
                 return action.stand(heading, "use")
 
+        # First break (or gap between targets) at midday: go home and spend time with family
+        tick = day.tick(observation)
+        if (
+            self.family_lunch is None
+            and self.active_task is None
+            and (self.break_ticks_remaining > 0 or self.role_target is None)
+            and self._family_time_due(tick)
+        ):
+            self.family_lunch = {"stage": "going", "since": tick}
+            self.break_ticks_remaining = 0
+            self.hop_point = None
+            self._path = None
+        if self.family_lunch is not None:
+            return self._family_lunch_tick(observation, heading, here, tick)
+
         # Break after completing a task: idle-hop for a random duration (still lighting lamps en route)
         if self.break_ticks_remaining > 0:
             self.break_ticks_remaining -= 1
@@ -806,6 +1051,14 @@ class Agent:
         return self._advance_hop(observation, heading, here, self.role_target["position"])
 
     def act(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction:
+        """Choose this tick's action, adding a wave if we greeted a friend on the move."""
+        self._passing_emote = None
+        chosen = self._decide(observation)
+        if self._passing_emote is not None and int(chosen["action"]) == 0:
+            return action.walk(float(chosen["heading"]), float(chosen["speed"]), self._passing_emote)
+        return chosen
+
+    def _decide(self, observation: ThreeBranchesObservation) -> ThreeBranchesAction:
         """Choose one action from current observation and persistent day state."""
 
         here = me.position(observation)
@@ -864,6 +1117,15 @@ class Agent:
             match = _CLAIM_PATTERN.fullmatch(str(message.get("text", "")))
             if match:
                 self.claims[match.group(1)] = (sender, int(message.get("tick", 0)))
+        for message in inbox or ():
+            sender = message.get("from")
+            if not isinstance(sender, str) or message.get("to") != self.player_id:
+                continue
+            if _CLAIM_PATTERN.fullmatch(str(message.get("text", ""))):
+                continue
+            sent = int(message.get("tick", 0))
+            if self._cooled(sender, sent):
+                self._greeted_by(sender, sent)  # spoken to directly: answer them
         if not self._outbox:
             return None
         messages, self._outbox = self._outbox, []
