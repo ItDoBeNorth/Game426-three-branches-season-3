@@ -39,3 +39,11 @@ Test the connection with:
 ```console
 python -m sandbox llm
 ```
+
+## Reflection
+Season 3: With chat now available, the goal of this season was to make the village more lively. I added in relationships and greetings and chats accordingly, a social session in the beginning, and also optimised greetings and task choosing by implementing checking if the task is already done or has been claimed by another person. i also optimised task timing and pathfinding. 
+
+## AI Use Disclosure and Reflection
+I used Claude Code in VS Code. It coded all of this based on my pseudocode and instructions. I verified each set of code it wrote before approving it, reverted and asked for changes as needed, tested by watching and eval, and discussed my ideas for solutions before committing to one. I did not write any code directly, but read through it to check it. I had it set to ask for approval before committing anything, and that worked especially during testing and understanding what code was being changed. Planning mode helped a lot, and I was able to go through each step slowly to understand whats going on. 
+
+
